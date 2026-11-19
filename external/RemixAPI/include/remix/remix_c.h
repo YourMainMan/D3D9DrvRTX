@@ -53,7 +53,7 @@
 #define REMIXAPI_VERSION_GET_PATCH(version) (((uint64_t)(version)      ) & (uint64_t)0xFFFF)
 
 #define REMIXAPI_VERSION_MAJOR 0
-#define REMIXAPI_VERSION_MINOR 5
+#define REMIXAPI_VERSION_MINOR 6
 #define REMIXAPI_VERSION_PATCH 1
 
 
