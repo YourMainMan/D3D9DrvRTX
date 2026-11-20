@@ -7,6 +7,73 @@
 
 IMPLEMENT_CLASS(UD3D9Render);
 
+/*-----------------------------------------------------------------------------
+	Experimental: Unreal volumetric fog maps (EnableFogMaps in D3D9DrvRTX.ini)
+	The RTX path only draws base textures, so the engine's fog maps were never
+	built or drawn. When enabled, ask the engine's light manager to build fog
+	maps for the visible surfaces and draw them as an additive overlay, the same
+	way the original renderer did (PF_Highlighted pass on top of the surface).
+-----------------------------------------------------------------------------*/
+#if UNREAL_GOLD_OLDUNREAL
+static std::unordered_map<INT, FSurfaceFacet*> gFogSurfFacets;
+static UBOOL gEnableFogMaps = 0;
+static bool gFogConfigRead = false;
+
+static bool fogMapsEnabled() {
+	if (!gFogConfigRead) {
+		gFogConfigRead = true;
+		UBOOL value = 0;
+		if (GConfig->GetBool(TEXT("D3D9DrvRTX.D3D9RenderDevice"), TEXT("EnableFogMaps"), value, TEXT("D3D9DrvRTX"))) {
+			gEnableFogMaps = value;
+		}
+		debugf(NAME_D3D9DrvRTX, TEXT("EnableFogMaps = %d"), (INT)gEnableFogMaps);
+	}
+	return gEnableFogMaps != 0;
+}
+
+static void drawFogMapsRTX(FSceneNode* frame, UD3D9RenderDevice* d3d9Dev) {
+	guard(drawFogMapsRTX);
+	FLightManagerBase* lightManager = UEngine::GLightManager;
+	if (!lightManager || gFogSurfFacets.empty()) {
+		return;
+	}
+
+	// Build lightmap data (creates the per-surface light cache) and then the fog maps
+	lightManager->SetupSurfsLightmaps(frame, 0);
+	lightManager->SetupSurfsFogmaps(frame);
+
+	std::unordered_set<INT> drawnSurfs;
+	for (FBspDrawList* pass : frame->Draw) {
+		for (FBspDrawList* drawList = pass; drawList; drawList = drawList->Next) {
+			FBspLightMap* lightData = drawList->LightData;
+			if (!lightData || !lightData->FogMapInfo) {
+				continue;
+			}
+			if (!drawnSurfs.insert(drawList->iSurf).second) {
+				continue;
+			}
+			auto it = gFogSurfFacets.find(drawList->iSurf);
+			if (it == gFogSurfFacets.end() || !it->second) {
+				continue;
+			}
+
+			// Copy the world space facet, without the base texture panning hack
+			FSurfaceFacet fogFacet = *it->second;
+			fogFacet.Span = nullptr;
+
+			FSurfaceInfo fogSurface{};
+			fogSurface.Level = frame->Level;
+			fogSurface.PolyFlags = PF_Highlighted | PF_NoOcclude;
+			fogSurface.Texture = lightData->FogMapInfo;
+
+			std::vector<FSurfaceFacet*> fogFacets{ &fogFacet };
+			d3d9Dev->drawLevelSurfaces(frame, fogSurface, fogFacets);
+		}
+	}
+	unguard;
+}
+#endif
+
 UD3D9Render::UD3D9Render() : URender() {
 	guard(UD3D9Render::UD3D9Render);
 	dout << "Constructing UD3D9Render!" << std::endl;
@@ -225,6 +292,21 @@ void UD3D9Render::onLevelChange(FSceneNode* frame) {
 	currentLevelData.facetsMemMark.Pop();
 	currentLevelData.facets = ModelFacets();
 	getLevelModelFacets(frame, currentLevelData.facets);
+#if UNREAL_GOLD_OLDUNREAL
+	// Map each surface to its world space facet for the fog map overlay
+	gFogSurfFacets.clear();
+	for (auto& zonePasses : currentLevelData.facets.facetPairs) {
+		for (auto& passBuckets : zonePasses) {
+			for (auto& facetPair : passBuckets) {
+				for (SurfaceData& surfData : facetPair.bucket) {
+					if (surfData.facet) {
+						gFogSurfFacets[surfData.iSurf] = surfData.facet;
+					}
+				}
+			}
+		}
+	}
+#endif
 	currentLevelData.lastLevelTime = frame->Level->TimeSeconds;
 	currentLevelData.anchors.clear();
 
@@ -398,6 +480,12 @@ void UD3D9Render::DrawWorld(FSceneNode* frame) {
 	d3d9Dev->startWorldDraw(frame);
 
 	drawFrame(frame, d3d9Dev, modelFacets, objs, lockedTextures);
+
+#if UNREAL_GOLD_OLDUNREAL
+	if (fogMapsEnabled()) {
+		drawFogMapsRTX(frame, d3d9Dev);
+	}
+#endif
 
 	FLOAT deltaTime = frame->Level->TimeSeconds - currentLevelData.lastLevelTime;
 	currentLevelData.lastLevelTime = frame->Level->TimeSeconds;
