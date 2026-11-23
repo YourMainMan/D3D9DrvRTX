@@ -4,8 +4,82 @@
 #include <bit>
 #include <bitset>
 #include <unordered_set>
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <cwctype>
+#include "nlohmann/json.hpp"
 
 IMPLEMENT_CLASS(UD3D9Render);
+
+/*-----------------------------------------------------------------------------
+	Translucent textures (D3D9DrvRTX_config.json -> "translucent_textures")
+	Map of texture name fragment -> opacity, e.g. { "Liquids.": 0.6 }.
+	Level surfaces whose texture path name contains a fragment are drawn
+	alpha blended at that opacity using the ORIGINAL texture, so Remix renders
+	them see-through. Matching is on the surface's base texture, so every frame
+	of an animated (flipbook) texture is covered. Every level surface texture
+	name is written to Unreal.log once ("RTX surface texture: ...") to help
+	fill the list in. Re-read on every level load.
+-----------------------------------------------------------------------------*/
+#if UNREAL_GOLD_OLDUNREAL
+static std::vector<std::pair<std::wstring, float>> gTranslucentTex;
+static std::unordered_map<UTexture*, float> gTranslucentCache;
+static std::unordered_set<std::wstring> gLoggedSurfTex;
+static bool gTranslucentRead = false;
+
+static std::wstring lowerWide(std::wstring s) {
+	for (auto& c : s) c = (wchar_t)towlower(c);
+	return s;
+}
+
+static void readTranslucentTextures() {
+	if (gTranslucentRead) return;
+	gTranslucentRead = true;
+	gTranslucentTex.clear();
+	std::ifstream file("D3D9DrvRTX_config.json");
+	if (!file.is_open()) return;
+	try {
+		nlohmann::json config = nlohmann::json::parse(file);
+		if (config.is_object() && config.contains("translucent_textures")) {
+			nlohmann::json& list = config["translucent_textures"];
+			if (list.is_object()) {
+				for (const auto& [key, value] : list.items()) {
+					if (!value.is_number()) continue;
+					float a = value.get<float>();
+					if (a < 0.0f) a = 0.0f;
+					if (a > 1.0f) a = 1.0f;
+					gTranslucentTex.emplace_back(lowerWide(std::wstring(key.begin(), key.end())), a);
+				}
+			}
+		}
+	}
+	catch (...) {
+		debugf(NAME_D3D9DrvRTX, TEXT("translucent_textures: could not parse D3D9DrvRTX_config.json"));
+	}
+	debugf(NAME_D3D9DrvRTX, TEXT("translucent_textures: %d entries"), (INT)gTranslucentTex.size());
+}
+
+// Returns opacity (0 < a < 1) if the texture should be drawn translucent, 0 otherwise.
+static float translucentAlpha(UTexture* texture) {
+	if (!texture) return 0.0f;
+	readTranslucentTextures();
+	auto it = gTranslucentCache.find(texture);
+	if (it != gTranslucentCache.end()) return it->second;
+	std::wstring name = lowerWide(std::wstring(appToUnicode(texture->GetPathName())));
+	float alpha = 0.0f;
+	for (const auto& [fragment, a] : gTranslucentTex) {
+		if (!fragment.empty() && name.find(fragment) != std::wstring::npos) {
+			alpha = a;
+			break;
+		}
+	}
+	if (alpha >= 0.999f) alpha = 0.0f; // 1.0 means leave it opaque
+	gTranslucentCache[texture] = alpha;
+	return alpha;
+}
+#endif
 
 /*-----------------------------------------------------------------------------
 	Experimental: Unreal volumetric fog maps (EnableFogMaps in D3D9DrvRTX.ini)
@@ -162,6 +236,20 @@ void UD3D9Render::getLevelModelFacets(FSceneNode* frame, ModelFacets& modelFacet
 			continue;
 		}
 
+#if UNREAL_GOLD_OLDUNREAL
+		{
+			std::wstring texName(appToUnicode(texture->GetPathName()));
+			if (gLoggedSurfTex.insert(texName).second) {
+				debugf(NAME_D3D9DrvRTX, TEXT("RTX surface texture: %s"), texture->GetPathName());
+			}
+		}
+		if (translucentAlpha(texture) > 0.0f) {
+			// Draw after solid geometry, no depth write, plain alpha blending
+			flags &= ~(PF_Translucent | PF_Modulated | PF_Highlighted | PF_Masked);
+			flags |= PF_NoOcclude | PF_AlphaBlend;
+		}
+#endif
+
 		// Sort into opaque and non passes
 		RPASS pass = (flags & PF_NoOcclude) ? RPASS::NONSOLID : RPASS::SOLID;
 		for (ZoneNodes& zoneNodes: surfaceNodes[iSurf]) {
@@ -291,6 +379,10 @@ void UD3D9Render::onLevelChange(FSceneNode* frame) {
 	currentLevelData.currentLevelName = frame->Level->URL.Map;
 	currentLevelData.facetsMemMark.Pop();
 	currentLevelData.facets = ModelFacets();
+#if UNREAL_GOLD_OLDUNREAL
+	gTranslucentRead = false;
+	gTranslucentCache.clear();
+#endif
 	getLevelModelFacets(frame, currentLevelData.facets);
 #if UNREAL_GOLD_OLDUNREAL
 	// Map each surface to its world space facet for the fog map overlay
@@ -628,7 +720,23 @@ void UD3D9Render::drawFrame(FSceneNode* frame, UD3D9RenderDevice* d3d9Dev, Model
 					facets.push_back(surface.facet);
 				}
 
+#if UNREAL_GOLD_OLDUNREAL
+				const float surfAlpha = (flags & PF_AlphaBlend) ? translucentAlpha(texture) : 0.0f;
+#else
+				const float surfAlpha = 0.0f;
+#endif
+				if (surfAlpha > 0.0f) {
+					d3d9Dev->EndBuffering();
+					const BYTE a = (BYTE)appRound(surfAlpha * 255.0f);
+					d3d9Dev->m_d3dDevice->SetRenderState(D3DRS_TEXTUREFACTOR, D3DCOLOR_ARGB(a, 255, 255, 255));
+					d3d9Dev->m_d3dDevice->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+				}
 				d3d9Dev->drawLevelSurfaces(frame, surfaceInfo, facets);
+				if (surfAlpha > 0.0f) {
+					d3d9Dev->EndBuffering();
+					d3d9Dev->m_d3dDevice->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
+					d3d9Dev->m_d3dDevice->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFFFFFFFF);
+				}
 #if !UTGLR_NO_DECALS
 				if (frame->Viewport->GetOuterUClient()->Decals) {
 					for (const SurfaceData& surface : surfaces) {
