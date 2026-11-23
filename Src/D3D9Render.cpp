@@ -23,6 +23,7 @@ IMPLEMENT_CLASS(UD3D9Render);
 	name is written to Unreal.log once ("RTX surface texture: ...") to help
 	fill the list in. Re-read on every level load.
 -----------------------------------------------------------------------------*/
+extern BYTE gRTXSurfaceAlpha;
 #if UNREAL_GOLD_OLDUNREAL
 static std::vector<std::pair<std::wstring, float>> gTranslucentTex;
 static std::unordered_map<UTexture*, float> gTranslucentCache;
@@ -727,15 +728,12 @@ void UD3D9Render::drawFrame(FSceneNode* frame, UD3D9RenderDevice* d3d9Dev, Model
 #endif
 				if (surfAlpha > 0.0f) {
 					d3d9Dev->EndBuffering();
-					const BYTE a = (BYTE)appRound(surfAlpha * 255.0f);
-					d3d9Dev->m_d3dDevice->SetRenderState(D3DRS_TEXTUREFACTOR, D3DCOLOR_ARGB(a, 255, 255, 255));
-					d3d9Dev->m_d3dDevice->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+					gRTXSurfaceAlpha = (BYTE)Clamp(appRound(surfAlpha * 255.0f), 1, 254);
 				}
 				d3d9Dev->drawLevelSurfaces(frame, surfaceInfo, facets);
 				if (surfAlpha > 0.0f) {
 					d3d9Dev->EndBuffering();
-					d3d9Dev->m_d3dDevice->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_CURRENT);
-					d3d9Dev->m_d3dDevice->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFFFFFFFF);
+					gRTXSurfaceAlpha = 255;
 				}
 #if !UTGLR_NO_DECALS
 				if (frame->Viewport->GetOuterUClient()->Decals) {

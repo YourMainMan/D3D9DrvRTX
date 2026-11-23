@@ -5859,6 +5859,10 @@ void UD3D9RenderDevice::RenderPassesExec(void) {
 	unguard;
 }
 
+// Opacity for the level surfaces being drawn (255 = opaque). Set by UD3D9Render for
+// textures listed in "translucent_textures"; carried in vertex alpha so Remix sees it.
+BYTE gRTXSurfaceAlpha = 255;
+
 //Must be called with (m_rpPassCount > 0)
 void UD3D9RenderDevice::RenderPassesNoCheckSetup(void) {
 	INT i;
@@ -5901,7 +5905,7 @@ void UD3D9RenderDevice::RenderPassesNoCheckSetup(void) {
 		pVertexColorArray->y = vert.pos.y;
 		pVertexColorArray->z = vert.pos.z;
 		pVertexColorArray->norm = vert.norm;
-		pVertexColorArray->color = vert.Color;
+		pVertexColorArray->color = (gRTXSurfaceAlpha == 255) ? vert.Color : ((vert.Color & 0x00FFFFFF) | ((DWORD)gRTXSurfaceAlpha << 24));
 		pVertexColorArray++;
 	}
 
